@@ -36,15 +36,19 @@ echo "      ✓ pip 安装完成"
 echo "[3/6] 修补 brotli + aiohttp 兼容性..."
 BROTLI_FIX="$SKILL_DIR/scripts/brotli_fix.py"
 cat > "$BROTLI_FIX" << 'PYEOF'
-"""brotli + aiohttp 兼容性补丁 — 在 use_biliSub 前 import 即可"""
+"""
+brotli + aiohttp 兼容性补丁 — 在调用 biliSub 前 import 即可。
+aiohttp 3.14+ 无 _decompress_data，brotli 1.1+ 已修复兼容性。
+"""
 import aiohttp.http_parser
-orig_decompress = aiohttp.http_parser.HttpParser._decompress_data
-def _patched_decompress(self, data):
-    try:
-        return orig_decompress(self, data)
-    except (TypeError, Exception):
-        return b""
-aiohttp.http_parser.HttpParser._decompress_data = _patched_decompress
+if hasattr(aiohttp.http_parser.HttpParser, '_decompress_data'):
+    orig_decompress = aiohttp.http_parser.HttpParser._decompress_data
+    def _patched_decompress(self, data):
+        try:
+            return orig_decompress(self, data)
+        except (TypeError, Exception):
+            return b""
+    aiohttp.http_parser.HttpParser._decompress_data = _patched_decompress
 PYEOF
 echo "      ✓ brotli 补丁已写入 $BROTLI_FIX"
 

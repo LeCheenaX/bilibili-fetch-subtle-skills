@@ -1,234 +1,242 @@
 #!/usr/bin/env python3
 """
-混合调度分配器 — B站视频字幕混合获取。
+三路调度分配器 — B站视频字幕混合获取。
 
-输入：JSON [[P序号, 时长秒], ...]  [可选 max_kedou]
-输出：JSON {kedou: [P序号...], base: [P序号...], small: [P序号...]}
+输入：JSON 格式的调度请求
+输出：分配表 + 各通道预计耗时
 
-算法核心：
-  对所有可能的 k（Kedou 数量，从 max_kedown 到 0）搜索最优分配。
-  Kedou 拿最长的 P（发挥固定 20s 的优势），剩余 P 在 Base/Small 间优化分配。
-  目标：|cloud - local| 最小，优先 cloud > local。
+核心策略：长视频→API/Kedou（固定成本），短视频→Whisper（可变成本）
+目标：最小化 max(api_total, kedou_total, whisper_total)
 
-速度基准（实测，CPU推理）：
-  - Kedou:  固定 20s/P
-  - Base:   duration / 7
-  - Small:  duration / 2.4
+通道特性：
+  - API:     40s/P固定，与视频时长无关
+  - Kedou:   35s/P固定，与视频时长无关
+  - Small:   duration/2.4，仅做 ≤400s 的视频
+  - Base:    duration/6，仅做 >400s 的视频
+  - API/Kedou 互不干扰独立运行，Whisper内Small和Base共享CPU串行
 """
 
 import sys
 import json
 
-KEDOU_TIME = 20.0
-BASE_FACTOR = 7.0
-SMALL_FACTOR = 2.4
-
-# Small 模型只用于 < 7 分钟的视频
-SMALL_MAX_DURATION = 420  # 7分钟 = 420秒
-
-# Small 比 Base 每单位 duration 多花的额外时间比
-# 1/2.4 - 1/7 ≈ 0.2738 s per duration second
-SMALL_EXTRA_RATIO = 1.0 / SMALL_FACTOR - 1.0 / BASE_FACTOR
+# ========== 时间常数 ==========
+API_TIME = 40.0        # s/P, 浏览器DevTools全路径
+KEDOU_TIME = 35.0      # s/P, Kedou云端处理
+SMALL_SPEED = 2.4      # 实时倍率, 仅≤400s
+BASE_SPEED = 6.0       # 实时倍率, 仅>400s
+SMALL_MAX_DUR = 400    # Small最大视频时长(秒)
 
 
-def allocate(pages, max_kedou=10):
-    """
-    pages: [(p_number, duration_seconds), ...]
-    max_kedou: 最多分配几个 P 给 Kedou
+def estimate_whisper_time(duration):
+    """估算单个P走Whisper路线的耗时"""
+    if duration <= SMALL_MAX_DUR:
+        return duration / SMALL_SPEED  # Small模型
+    else:
+        return duration / BASE_SPEED   # Base模型
 
-    Returns: {kedou: [p...], base: [p...], small: [p...]}
-    """
-    if not pages:
-        return {"kedou": [], "base": [], "small": []}
 
-    total_n = len(pages)
+def channel_cost(duration, channel):
+    """单个P在指定通道的耗时"""
+    if channel == 'api':
+        return API_TIME
+    elif channel == 'kedou':
+        return KEDOU_TIME
+    elif channel == 'base':
+        return duration / BASE_SPEED
+    elif channel == 'small':
+        if duration > SMALL_MAX_DUR:
+            return float('inf')
+        return duration / SMALL_SPEED
+    return float('inf')
 
-    # N ≤ 4 → 全走 Kedou（P少不值得本地跑）
-    if total_n <= 4:
-        return {"kedou": sorted(p for p, _ in pages), "base": [], "small": []}
 
-    # 按时长降序
-    sorted_pages = sorted(pages, key=lambda x: x[1], reverse=True)
+def allocate(data):
+    channels = data.get('channels', {})
+    running = data.get('running', [])
+    pending = data.get('pending', [])
 
-    best = {
-        "result": None,
-        "cloud_time": 0,
-        "local_time": 0,
-        "score": float('inf'),
-        "cloud_gt_local": False,
-    }
+    api_avail = channels.get('api', {}).get('available', 0)
+    kedou_remain = channels.get('kedou', {}).get('remaining', 0)
+    base_exist = channels.get('whisper_base', {}).get('exists', 0)
+    small_exist = channels.get('whisper_small', {}).get('exists', 0)
 
-    def evaluate(k):
-        """搜索 k 个 P 给 Kedou，剩余在 Base/Small 间优化分配，返回 (result_dict, score)"""
-        kedou_ps = sorted_pages[:k]
-        local_ps = sorted_pages[k:]
+    # ---- 计算当前各通道的忙碌时间 ----
+    def busy_time(ch):
+        total = 0.0
+        for t in running:
+            if t.get('channel') == ch:
+                if ch == 'api':
+                    eta = API_TIME
+                elif ch == 'kedou':
+                    eta = KEDOU_TIME
+                elif ch == 'base':
+                    eta = t['duration'] / BASE_SPEED
+                elif ch == 'small':
+                    eta = t['duration'] / SMALL_SPEED
+                else:
+                    eta = 0
+                remaining = max(0, eta - t.get('elapsed', 0))
+                total += remaining
+        return total
 
-        cloud_time = k * KEDOU_TIME
+    api_busy = busy_time('api')
+    kedou_busy = busy_time('kedou')
+    # Whisper Base + Small 共享CPU，合并为一条队列
+    whisper_running = [t for t in running if t.get('channel') in ('base', 'small')]
+    whisper_busy = sum(
+        max(0, (t['duration'] / (BASE_SPEED if t['channel'] == 'base' else SMALL_SPEED))
+            - t.get('elapsed', 0))
+        for t in whisper_running
+    )
 
-        if not local_ps:
-            # 全部给了 Kedou（只在 N ≤ max_kedou 时可能）
-            return {
-                "kedou": sorted(p for p, _ in kedou_ps),
-                "base": [],
-                "small": []
-            }, cloud_time, 0.0
+    # ---- 待分配P按时长降序排列 ----
+    sorted_pending = sorted(pending, key=lambda x: x['duration'], reverse=True)
+    n = len(sorted_pending)
 
-        # -- 过滤：Small 只用于 < 420s 的视频 --
-        small_eligible = [(p, d) for p, d in local_ps if d < SMALL_MAX_DURATION]
-        base_only = [(p, d) for p, d in local_ps if d >= SMALL_MAX_DURATION]
+    # ---- 暴力搜索最优(api_count, kedou_count)组合 ----
+    # 对于小规模(n <= 20)，遍历所有可行分配
+    best_result = None
+    best_max = float('inf')
 
-        base_only_set = {p for p, _ in base_only}
-        base_only_dur = sum(d for _, d in base_only)
+    max_api_use = n if api_avail else 0  # API通道串行，可用则全部分配
+    max_kedou_use = min(kedou_remain, n)
 
-        # -- 计算基准时间 --
-        eligible_dur = sum(d for _, d in small_eligible)
-        total_dur = base_only_dur + eligible_dur
-        all_base_time = total_dur / BASE_FACTOR  # 所有 Ps 都用 Base
-        # 只计算 eligible Ps 全用 Small 的情况
-        all_eligible_small_time = base_only_dur / BASE_FACTOR + eligible_dur / SMALL_FACTOR
+    for api_c in range(0, max_api_use + 1):
+        for kedou_c in range(0, max_kedou_use + 1):
+            if api_c + kedou_c > n:
+                continue
 
-        # 在 Base 和 Small 间分配，目标是让 local_time 尽量接近 cloud_time
-        # 方法：从 "全部 Base" 出发，选 eligible P 升到 Small 来增加 local_time
+            # 最长的api_c个→API，次长的kedou_c个→Kedou，剩余的→Whisper
+            api_ps = sorted_pending[:api_c]
+            kedou_ps = sorted_pending[api_c:api_c + kedou_c]
+            whisper_ps = sorted_pending[api_c + kedou_c:]
 
-        def _build_result(base_set, small_set):
-            """构建包含 base_only 的完整结果"""
-            full_base = set(base_set) | base_only_set
-            return {
-                "kedou": sorted(p for p, _ in kedou_ps),
-                "base": sorted(full_base),
-                "small": sorted(small_set)
+            # 检查Whisper是否需要模型
+            whisper_needed = len(whisper_ps) > 0
+            if whisper_needed:
+                has_small_needed = any(p['duration'] <= SMALL_MAX_DUR for p in whisper_ps)
+                has_base_needed = any(p['duration'] > SMALL_MAX_DUR for p in whisper_ps)
+                if has_small_needed and not small_exist:
+                    continue  # 需要Small但不可用
+                if has_base_needed and not base_exist:
+                    continue  # 需要Base但不可用
+
+            # 计算各通道总耗时
+            api_total = api_busy + api_c * API_TIME
+            kedou_total = kedou_busy + kedou_c * KEDOU_TIME
+            whisper_total = whisper_busy + sum(estimate_whisper_time(p['duration']) for p in whisper_ps)
+
+            # ---- 约束：除非API和Kedou都已耗尽，否则Whisper不得为瓶颈 ----
+            # "已耗尽"：API不可用(0) 且 Kedou余量不够覆盖所有待分配视频
+            api_exhausted = not api_avail
+            kedou_exhausted = kedou_remain < n
+            both_exhausted = api_exhausted and kedou_exhausted
+
+            fixed_max = max(api_total, kedou_total)
+            if not both_exhausted and whisper_total > fixed_max:
+                continue  # 违反约束：Whisper不可成为瓶颈
+
+            current_max = max(api_total, kedou_total, whisper_total)
+
+            if current_max < best_max:
+                best_max = current_max
+                best_result = (api_c, kedou_c, api_ps, kedou_ps, whisper_ps)
+
+    if best_result is None:
+        # 无可行方案
+        return {
+            "assignment": [{"p": p['p'], "channel": "none"} for p in sorted_pending],
+            "report": {
+                "api": {"count": 0, "est_time": 0},
+                "kedou": {"count": 0, "est_time": 0},
+                "whisper": {"count": 0, "est_time": 0, "detail": "无可用通道"},
+                "bottleneck": float('inf'),
+                "explain": "❌ 无可用通道组合"
             }
+        }
 
-        def _local_time_from(base_set, small_set, extra_acc):
-            """根据分配计算 local_time"""
-            return (sum(d for p, d in local_ps if p in base_set | base_only_set) / BASE_FACTOR
-                    + sum(d for p, d in local_ps if p in small_set) / SMALL_FACTOR)
+    api_c, kedou_c, api_ps, kedou_ps, whisper_ps = best_result
 
-        # ---- 情况 1: cloud 比全 Base 还小 → 全 Base + 强制 1 个 eligible Small ----
-        if cloud_time <= all_base_time:
-            base_set = {p for p, _ in small_eligible}
-            small_set = set()
+    # ---- 构建分配表 ----
+    assignment = []
+    for p in api_ps:
+        assignment.append({'p': p['p'], 'channel': 'api'})
+    for p in kedou_ps:
+        assignment.append({'p': p['p'], 'channel': 'kedou'})
+    for p in whisper_ps:
+        ch = 'small' if p['duration'] <= SMALL_MAX_DUR else 'base'
+        assignment.append({'p': p['p'], 'channel': ch})
 
-            # 选最短的 eligible P 升 Small（损失最小）
-            if small_eligible:
-                shortest = min(small_eligible, key=lambda x: x[1])
-                base_set.discard(shortest[0])
-                small_set.add(shortest[0])
+    # ---- 统计与报告 ----
+    api_count = sum(1 for a in assignment if a['channel'] == 'api')
+    kedou_count = sum(1 for a in assignment if a['channel'] == 'kedou')
+    base_count = sum(1 for a in assignment if a['channel'] == 'base')
+    small_count = sum(1 for a in assignment if a['channel'] == 'small')
 
-            local_time = _local_time_from(base_set, small_set, 0)
+    api_est = api_busy + api_count * API_TIME
+    kedou_est = kedou_busy + kedou_count * KEDOU_TIME
+    whisper_est = whisper_busy
+    for a in assignment:
+        if a['channel'] in ('base', 'small'):
+            dur = next(p['duration'] for p in pending + running if p.get('p') == a['p'])
+            whisper_est += estimate_whisper_time(dur)
 
-            return _build_result(base_set, small_set), cloud_time, local_time
+    bottleneck = max(api_est, kedou_est, whisper_est)
 
-        # ---- 情况 2: cloud 在全 Base 和全 eligible-Small 之间 → 精细搜索 ----
-        if cloud_time <= all_eligible_small_time:
-            needed_extra = cloud_time - all_base_time
+    whisper_detail_parts = []
+    if base_count > 0:
+        whisper_detail_parts.append(f"Base={base_count}")
+    if small_count > 0:
+        whisper_detail_parts.append(f"Small={small_count}")
+    whisper_detail = ", ".join(whisper_detail_parts) if whisper_detail_parts else "无"
 
-            # small_eligible 按时长升序（短 P 优先升 Small）
-            sorted_eligible = sorted(small_eligible, key=lambda x: x[1])
+    # 瓶颈说明
+    bottleneck_ch = []
+    if api_est >= bottleneck - 0.01:
+        bottleneck_ch.append(f"API({api_est:.0f}s)")
+    if kedou_est >= bottleneck - 0.01:
+        bottleneck_ch.append(f"Kedou({kedou_est:.0f}s)")
+    if whisper_est >= bottleneck - 0.01:
+        bottleneck_ch.append(f"Whisper({whisper_est:.0f}s)")
 
-            base_set = {p for p, _ in small_eligible}
-            small_set = set()
-            accumulated_extra = 0.0
+    # 策略说明
+    parts = []
+    if api_count > 0:
+        parts.append(f"API {api_count}个(最长的{api_c}个P, {api_est:.0f}s)")
+    if kedou_count > 0:
+        parts.append(f"Kedou {kedou_count}个, {kedou_est:.0f}s")
+    if base_count > 0:
+        parts.append(f"Base {base_count}个, 合计{sum(estimate_whisper_time(p['duration']) for p in whisper_ps if p['duration'] > SMALL_MAX_DUR):.0f}s")
+    if small_count > 0:
+        small_ps = [p for p in whisper_ps if p['duration'] <= SMALL_MAX_DUR]
+        parts.append(f"Small {small_count}个, 合计{sum(estimate_whisper_time(p['duration']) for p in small_ps):.0f}s")
+    explain = " → ".join(parts) if parts else (f"全部Whisper({whisper_detail})" if whisper_ps else "无待分配")
 
-            for idx, dur in sorted_eligible:
-                extra = dur * SMALL_EXTRA_RATIO
-                if accumulated_extra + extra <= needed_extra * 1.15:
-                    base_set.discard(idx)
-                    small_set.add(idx)
-                    accumulated_extra += extra
+    explain += f" | 瓶颈={'/'.join(bottleneck_ch)}"
 
-            # 如果没有任何 P 升到 Small（所有 eligible 都太短？），强制升最短的
-            if not small_set and sorted_eligible:
-                shortest = sorted_eligible[0]
-                base_set.discard(shortest[0])
-                small_set.add(shortest[0])
-                accumulated_extra = shortest[1] * SMALL_EXTRA_RATIO
-
-            local_time = _local_time_from(base_set, small_set, accumulated_extra)
-
-            return _build_result(base_set, small_set), cloud_time, local_time
-
-        # ---- 情况 3: cloud 大于全 eligible-Small → 所有 eligible 用 Small ----
-        return _build_result(set(), {p for p, _ in small_eligible}), cloud_time, all_eligible_small_time
-
-    # 对所有可能的 k 搜索（Kedou 数量）
-    # 上限：P数较多时受限于 max_kedou；P数较少时全给 Kedou
-    k_max = min(max_kedou, total_n)
-    # 但至少留 1 个给本地做质量兜底（除非本地只有 ≤4P，全给 Kedou）
-    k_max = k_max if total_n <= 4 else min(k_max, total_n - 1)
-    for k in range(k_max, -1, -1):
-        result, ct, lt = evaluate(k)
-        score = abs(ct - lt)
-        cgt = ct > lt
-
-        better = False
-        if cgt and not best["cloud_gt_local"]:
-            better = True  # 首次达成 cloud > local
-        elif cgt == best["cloud_gt_local"]:
-            if score < best["score"]:
-                better = True  # 同状态但分数更好
-            elif score == best["score"] and cgt and not best["cloud_gt_local"]:
-                better = True  # 同分但 cloud > local 优先
-
-        if better:
-            best["result"] = result
-            best["cloud_time"] = ct
-            best["local_time"] = lt
-            best["score"] = score
-            best["cloud_gt_local"] = cgt
-
-    if best["result"] is None:
-        return {"kedou": [], "base": sorted(p for p, _ in sorted_pages), "small": []}
-
-    return best["result"]
-
-
-def estimate_report(pages, result):
-    """生成预估耗时报告"""
-    dmap = {p: d for p, d in pages}
-
-    ct = len(result["kedou"]) * KEDOU_TIME
-
-    bt = sum(dmap[p] for p in result["base"]) / BASE_FACTOR if result["base"] else 0
-    st = sum(dmap[p] for p in result["small"]) / SMALL_FACTOR if result["small"] else 0
-    lt = bt + st
-
-    lines = []
-    lines.append(f"Cloud: Kedou x{len(result['kedou'])} → {ct:.0f}s")
-    if result["base"]:
-        base_parts = ", ".join(str(p) for p in result["base"][:6])
-        if len(result["base"]) > 6:
-            base_parts += f"...(+{len(result['base'])-6})"
-        lines.append(f"  Base [{base_parts}]: {bt:.0f}s")
-    if result["small"]:
-        small_parts = ", ".join(str(p) for p in result["small"])
-        lines.append(f"  Small [{small_parts}]: {st:.0f}s")
-    lines.append(f"Local 合计: {lt:.0f}s  (Base={bt:.0f}s + Small={st:.0f}s)")
-    lines.append(f"|Cloud - Local| = {abs(ct-lt):.0f}s")
-    lines.append(f"总瓶颈耗时: {max(ct, lt):.0f}s")
-    lines.append("✅ Cloud > Local" if ct > lt else "⚠️  Cloud < Local")
-
-    return "\n".join(lines)
+    return {
+        "assignment": sorted(assignment, key=lambda x: x['p']),
+        "report": {
+            "api": {"count": api_count, "est_time": round(api_est, 1)},
+            "kedou": {"count": kedou_count, "est_time": round(kedou_est, 1)},
+            "whisper": {
+                "count": base_count + small_count,
+                "est_time": round(whisper_est, 1),
+                "detail": whisper_detail
+            },
+            "bottleneck": round(bottleneck, 1),
+            "explain": explain
+        }
+    }
 
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python3 scripts/allocate.py '<pages_json>' [max_kedou]")
-        print("示例: python3 scripts/allocate.py '[[1,527],[2,749],[3,523]]' 10")
-        print("pages_json: [[P序号, 时长秒], ...]")
+        print("用法: python3 scripts/allocate.py '<调度请求JSON>'")
         sys.exit(1)
-
-    pages = json.loads(sys.argv[1])
-    max_kedou = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-
-    result = allocate(pages, max_kedou)
-
-    # JSON 输出
+    data = json.loads(sys.argv[1])
+    result = allocate(data)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-
-    # 报告
-    print()
-    print(estimate_report(pages, result))
 
 
 if __name__ == "__main__":
