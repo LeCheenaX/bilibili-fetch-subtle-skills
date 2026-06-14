@@ -971,6 +971,7 @@ print(f"瓶颈: {result['report']['bottleneck']}s — {result['report']['explain
 | biliSub batch 无输出 | grep 过滤 stdout 导致不显示进度 | 批处理脚本避免 grep 过滤，用 2>&1 输出完整日志 |
 | **CPU-only Whisper 极慢** | 无 GPU 时 base 模型约实时×0.8~1.5（813s视频≈17min），small 更慢 | 放后台运行并 notify_on_complete，不要前端阻塞。仅≤200s短视频用base，长视频走 API/Kedou |
 | **新视频（发布<24h）三路全失败** | Kedou返回"解析失败"（未收录），API返回空字幕（未处理），只有yt-dlp+Whisper可用 | 新视频的 fallback 路径：yt-dlp下载音频（需SESSDATA）→ Whisper base转写 |
+| **API连续快速重试仍串台（无间隔）** | 连续无间隔重试5次+模拟浏览器3s间隔30次，45次全部串台或空（BV1EKE16rEgU，SkillOpt视频）。串台内容包括音乐/美食/导航等完全无关内容 | B站字幕映射与请求间隔无关，连续快速重试不会比间隔重试命中率更高。该CID的映射已彻底损坏，只能走Kedou或Whisper |
 | **Whisper small CPU超时** | small模型实测在CPU上远慢于估算（340s视频300s+未完成） | 即使 ≤400s 视频也优先用base，small仅在精度要求极高且时间充裕时使用 |
 
 ## 附录：实测案例汇总（ServiceMesh 27集实战）
